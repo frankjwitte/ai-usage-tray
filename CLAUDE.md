@@ -25,14 +25,15 @@ Settings → `Write-Log` → Add-Type (P/Invoke + `AiFlyoutForm`) → fetch (`Ge
 - Never refresh or write the CLIs' token files. Read-only by design.
 
 ## Testing
-- `-Test [-DemoHistory] [-TestOut dir]`: prints tooltip/menu, saves icon + panel PNGs (dark and light). Hits live endpoints once per run.
+- `-Test [-TestOut dir]`: prints tooltip/menu, saves `icon.png` + `panel-dark.png`/`panel-light.png`. Hits live endpoints once per run.
+- `-Test -Demo`: offline. Uses made-up usage (`New-DemoUsage`) and history (`Add-DemoHistory`), with scale 2x. **Prefer this for UI work.** Regenerate the README screenshots with `-Test -Demo -TestOut docs`.
+- `-Test -DemoHistory`: live numbers plus a made-up chart history.
 - To test the tray app without disturbing the real one: copy the script, change the mutex name `Local\AiUsageTray` and `$StateDir`, and replace the final `Application::Run()` with a timer that captures state and exits.
 - Runtime state: `%LOCALAPPDATA%\AiUsageTray\` (`state.json`, `history.csv`, `app.log`).
 
 ## Open ideas / TODO
-- Test mode should use cached data instead of live endpoints.
 - `config.json` instead of editing script settings.
 - Claude Max: show per-model weekly limits (`seven_day_opus`, `seven_day_sonnet`) when present.
 - Panel placement for left/right taskbars.
 - Codex fallback: last `rate_limits` snapshot from `~/.codex/sessions/**/*.jsonl` when the endpoint fails.
-- `build.ps1`, LICENSE, `.gitignore` (exclude `AiUsageTray.exe`) before publishing.
+- `build.ps1` to replace the manual csc command in the README.

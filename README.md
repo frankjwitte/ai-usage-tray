@@ -2,7 +2,16 @@
 
 A Windows tray icon that shows how much of your weekly **Claude** (Pro/Max) and **Codex** (ChatGPT Plus/Pro) usage limits you have left, and whether it will last until the reset.
 
-- **Icon**: one split icon. The top half is Claude and the bottom half is Codex. Each half shows the % of the weekly limit left, colored green (>50%), amber (20–50%), red (<20%) or gray (can't update).
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/panel-dark.png">
+    <img src="docs/panel-light.png" width="340" alt="The popup panel: for Claude and Codex, a weekly bar with a pace marker, a forecast line, a 5-hour bar and a chart of this week's usage">
+  </picture>
+  <br>
+  <sub>The popup panel (demo data). Claude is on track; Codex is projected to run out before its reset.</sub>
+</p>
+
+- <img src="docs/icon.png" width="40" align="right" alt="Tray icon: 69 on green over 42 on amber"> **Icon**: one split icon. The top half is Claude and the bottom half is Codex. Each half shows the % of the weekly limit left, colored green (>50%), amber (20–50%), red (<20%) or gray (can't update).
 - **Hover**: a short summary with reset countdowns, the 5-hour window and the forecast.
 - **Click**: a popup panel with bars, a pace marker, a forecast ("At this pace: ~86% left at reset" / "runs out Tue 09:58") and a chart of this week's usage.
 - **Right-click**: full details, links to each service's usage page, refresh, *Color by forecast*, *Start with Windows*, and quit.
@@ -78,4 +87,9 @@ These are at the top of `AiUsageTray.ps1`: refresh interval, weekly alert thresh
 
 ## Development
 
-`-Test` prints the current tooltip and menu text and saves icon and panel previews to `%TEMP%\AiUsageTray-preview`. Add `-DemoHistory` to preview the chart with made-up data. Test mode queries the live endpoints, so use it sparingly. See `CLAUDE.md` for code structure notes.
+`-Test` prints the current tooltip and menu text and saves icon and panel previews to `%TEMP%\AiUsageTray-preview`. It queries each endpoint once, so use it sparingly.
+
+- `-Test -Demo` uses made-up numbers and history and makes no network calls. The screenshots in `docs/` come from `-Test -Demo -TestOut docs`.
+- `-Test -DemoHistory` uses live numbers with a made-up chart history.
+
+See `CLAUDE.md` for code structure notes.

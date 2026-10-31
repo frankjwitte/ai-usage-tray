@@ -13,7 +13,8 @@ param(
     [switch]$Test,
     [string]$TestOut = (Join-Path $env:TEMP 'AiUsageTray-preview'),
     [string]$MakeIco,
-    [switch]$DemoHistory,
+    [switch]$DemoHistory,  # with -Test: live numbers plus a made-up chart history
+    [switch]$Demo,         # with -Test: made-up numbers and history, no network (used for README screenshots)
     [switch]$LibOnly      # internal: define functions only (used by the background fetch runspace)
 )
 
@@ -698,14 +699,60 @@ if ($LibOnly) { return }
 
 if ($MakeIco) { Save-Ico $MakeIco; "Saved $MakeIco"; return }
 
+function New-DemoUsage([string]$key) {
+    # Made-up numbers for -Demo (screenshots / offline testing). Claude on track, Codex projected to run out.
+    $now = [DateTimeOffset]::UtcNow
+    if ($key -eq 'claude') {
+        return [pscustomobject]@{ Plan = 'Pro'; WeekUsed = 31.0; WeekResetAt = $now.AddDays(3.8); WeekSeconds = 604800
+                                  FiveUsed = 41.0; FiveResetAt = $now.AddMinutes(134); LimitReached = $false }
+    }
+    return [pscustomobject]@{ Plan = 'Plus'; WeekUsed = 58.0; WeekResetAt = $now.AddDays(4.3); WeekSeconds = 604800
+                              FiveUsed = 12.0; FiveResetAt = $now.AddMinutes(201); LimitReached = $false }
+}
+
+# Fake, not saved: a plausible work-hours usage curve ending at the current WeekUsed
+function Add-DemoHistory([string]$key, $u) {
+    $reset = $u.WeekResetAt.ToUnixTimeSeconds(); $start = $reset - $u.WeekSeconds
+    $nowT = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $rnd = New-Object System.Random (7 + $key.Length)
+    $steps = New-Object System.Collections.Generic.List[object]; $dayFactor = @{}
+    for ($t = $start; $t -lt $nowT; $t += 1800) {
+        $local = [DateTimeOffset]::FromUnixTimeSeconds($t).LocalDateTime
+        if (-not $dayFactor.ContainsKey($local.Date)) { $dayFactor[$local.Date] = 0.4 + 1.2 * $rnd.NextDouble() }
+        $wt = 0.0
+        if ($local.Hour -ge 9 -and $local.Hour -lt 18) { $wt = (0.3 + $rnd.NextDouble()) * $dayFactor[$local.Date] }
+        elseif ($local.Hour -ge 20 -and $local.Hour -lt 23) { $wt = 0.4 * $rnd.NextDouble() * $dayFactor[$local.Date] }
+        $steps.Add(@($t, $wt))
+    }
+    $total = 0.0; foreach ($s in $steps) { $total += $s[1] }
+    if ($total -le 0) { return }
+    $v = 0.0
+    foreach ($s in $steps) {
+        $v += $s[1] / $total * $u.WeekUsed
+        $script:History.Add([pscustomobject]@{ T = $s[0]; Key = $key; Used = $v; Reset = $reset })
+    }
+}
+
 if ($Test) {
     New-Item -ItemType Directory -Force -Path $TestOut | Out-Null
-    $st = foreach ($svc in $Services) {
-        $entry = @{ Usage = $null; Error = $null; LastOk = (Get-Date) }
-        try { $entry.Usage = Get-Usage $svc.Key } catch { $entry.Error = $_.Exception.Message }
-        Get-Status $svc $entry $false
+    $script:Data = @{}; $script:LastUpdate = Get-Date
+    if ($Demo) {
+        $script:State = @{ colorByPace = $false }   # don't use the real setting for screenshots
+        $script:Scale = 2.0                          # crisp on high-DPI displays; README shows it at half size
+    } else {
+        $script:State = Get-State
+        Import-History -NoPrune   # preview must not modify the real history file
     }
-    $tip = (@($st[0].Tip) + @($st[1].Tip) + "Updated $((Get-Date).ToString('HH:mm'))") -join "`n"
+    # One fetch (or demo data) per service, reused for every preview below
+    foreach ($svc in $Services) {
+        $entry = @{ Usage = $null; Error = $null; LastOk = (Get-Date) }
+        if ($Demo) { $entry.Usage = New-DemoUsage $svc.Key }
+        else { try { $entry.Usage = Get-Usage $svc.Key } catch { $entry.Error = $_.Exception.Message } }
+        if ($entry.Usage -and ($Demo -or $DemoHistory)) { Add-DemoHistory $svc.Key $entry.Usage }
+        $script:Data[$svc.Key] = $entry
+    }
+    $st = @(foreach ($svc in $Services) { Get-Status $svc $script:Data[$svc.Key] $script:State.colorByPace })
+    $tip = (@($st[0].Tip) + @($st[1].Tip) + "Updated $($script:LastUpdate.ToString('HH:mm'))") -join "`n"
     "----- Tooltip ($($tip.Length)/127 chars)"; $tip
     "----- Menu"; $st[0].Menu; $st[1].Menu
     $size = [System.Windows.Forms.SystemInformation]::SmallIconSize.Width
@@ -714,33 +761,13 @@ if ($Test) {
     $g = [System.Drawing.Graphics]::FromImage($big)
     $g.InterpolationMode = 'NearestNeighbor'; $g.PixelOffsetMode = 'Half'
     $g.DrawImage($bmp, 0, 0, $size * 8, $size * 8); $g.Dispose()
-    $out = Join-Path $TestOut 'combo-now.png'; $big.Save($out); $big.Dispose(); $bmp.Dispose()
+    $out = Join-Path $TestOut 'icon.png'; $big.Save($out); $big.Dispose(); $bmp.Dispose()
     "Saved $out ($size px icon, 8x zoom)"
     # Popup panel previews in both themes
-    $script:State = Get-State; $script:Data = @{}; $script:LastUpdate = Get-Date
-    Import-History -NoPrune   # preview must not modify the real history file
-    for ($k = 0; $k -lt $Services.Count; $k++) {
-        $script:Data[$Services[$k].Key] = @{ Usage = $null; Error = $null; LastOk = (Get-Date) }
-        try { $script:Data[$Services[$k].Key].Usage = Get-Usage $Services[$k].Key } catch { $script:Data[$Services[$k].Key].Error = $_.Exception.Message }
-    }
-    if ($DemoHistory) {
-        # Fake, not saved: a plausible usage curve so the chart can be previewed
-        foreach ($svc in $Services) {
-            $u = $script:Data[$svc.Key].Usage; if (-not $u) { continue }
-            $reset = $u.WeekResetAt.ToUnixTimeSeconds(); $start = $reset - $u.WeekSeconds
-            $nowT = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-            $u.WeekUsed = 52; $v = 0.0
-            for ($t = $start; $t -lt $nowT; $t += 3600) {
-                $hour = [DateTimeOffset]::FromUnixTimeSeconds($t).LocalDateTime.Hour
-                if ($hour -ge 9 -and $hour -lt 18) { $v += 52.0 / (($nowT - $start) / 86400 * 9) }
-                $script:History.Add([pscustomobject]@{ T = $t; Key = $svc.Key; Used = [math]::Min(52, $v); Reset = $reset })
-            }
-        }
-    }
     foreach ($tm in 'dark', 'light') {
         $script:ForceTheme = $tm
         $r = Render-Flyout
-        $out = Join-Path $TestOut "flyout-$tm.png"; $r.Bitmap.Save($out); $r.Bitmap.Dispose()
+        $out = Join-Path $TestOut "panel-$tm.png"; $r.Bitmap.Save($out); $r.Bitmap.Dispose()
         "Saved $out"
     }
     return
