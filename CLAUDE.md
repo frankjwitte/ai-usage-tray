@@ -19,6 +19,7 @@ Settings → `Write-Log` → Add-Type (P/Invoke + `AiFlyoutForm`) → fetch (`Ge
 - Codex: the weekly window is the *longer* of primary/secondary. Don't use `rate_limit.limit_reached` for weekly (it's also set by the 5-hour window).
 - 5-hour alert re-arms only when that window is back above threshold+20. Claude's 5h `resets_at` can slide, so it isn't used as a "new window" signal.
 - Weekly reset detection: reset time moved >1h later. Codex reset times jitter ±1s.
+- **Reset times can be missing.** When there's no active window (idle 5h window, or no usage yet this week), Claude returns `resets_at: null` and Codex may return 0 or null. `FiveResetAt` may be `$null`, so guard every use. An idle week gets `WeekIdle = $true` plus a placeholder `WeekResetAt` (now + window), which moves on every fetch: skip reset detection and history for it. `Get-AllStatus` turns per-service display errors into a gray "?" half (logged once via `Write-LogOnce`).
 - NotifyIcon tooltip: 127-char limit, set via reflection (.NET Framework caps the property at 63). Keep tooltip text short.
 - Script file must stay ASCII-only (PS 5.1 reads BOM-less files as ANSI). Use `[char]` codes, e.g. `$Dot = [char]0x00B7`.
 - PS gotchas hit before: `[math]::Max(0, x)` picks the int overload (use `0.0`). In array literals, `,` binds tighter than `+`/`-`. Don't use `GetNewClosure()` in event handlers (it loses script functions); pass data via `.Tag` or `$script:` vars.

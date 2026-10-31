@@ -129,7 +129,8 @@ function Get-ClaudeUsage {
         WeekUsed = [double]$r.seven_day.utilization
         WeekResetAt = ConvertTo-Dto $r.seven_day.resets_at
         WeekSeconds = 7 * 86400
-        FiveUsed = $null; FiveResetAt = $null
+        WeekIdle = $false
+        FiveUsed = $null; FiveResetAt = $null   # FiveResetAt stays $null when no 5-hour window is active
         LimitReached = $false
     }
     if ($r.five_hour -and $null -ne $r.five_hour.utilization) {
@@ -137,7 +138,22 @@ function Get-ClaudeUsage {
         $u.FiveResetAt = ConvertTo-Dto $r.five_hour.resets_at
     }
     if ($u.WeekUsed -ge 100) { $u.LimitReached = $true }
+    return (Set-WeekIdle $u)
+}
+
+# No usage yet this week means no reset time. Mark it idle and assume a full window from now,
+# so the rest of the code always has a WeekResetAt.
+function Set-WeekIdle($u) {
+    if (-not $u.WeekResetAt) {
+        $u.WeekIdle = $true
+        $u.WeekResetAt = [DateTimeOffset]::UtcNow.AddSeconds($u.WeekSeconds)
+    }
     return $u
+}
+
+function ConvertFrom-Unix($v) {
+    if ($null -eq $v -or [int64]$v -le 0) { return $null }
+    return [DateTimeOffset]::FromUnixTimeSeconds([int64]$v)
 }
 
 function Get-CodexUsage {
@@ -162,8 +178,9 @@ function Get-CodexUsage {
     $u = [pscustomobject]@{
         Plan = $plan
         WeekUsed = [double]$week.used_percent
-        WeekResetAt = [DateTimeOffset]::FromUnixTimeSeconds([int64]$week.reset_at)
+        WeekResetAt = ConvertFrom-Unix $week.reset_at
         WeekSeconds = [int64]$week.limit_window_seconds
+        WeekIdle = $false
         FiveUsed = $null; FiveResetAt = $null
         # Weekly only. rate_limit.limit_reached is also true when just the 5-hour window is used up.
         LimitReached = ([double]$week.used_percent -ge 100)
@@ -171,9 +188,9 @@ function Get-CodexUsage {
     if ($wins.Count -gt 1) {
         $five = $wins[0]
         $u.FiveUsed = [double]$five.used_percent
-        $u.FiveResetAt = [DateTimeOffset]::FromUnixTimeSeconds([int64]$five.reset_at)
+        $u.FiveResetAt = ConvertFrom-Unix $five.reset_at
     }
-    return $u
+    return (Set-WeekIdle $u)
 }
 
 function Get-Usage([string]$Key) {
@@ -216,6 +233,7 @@ function Get-Forecast($u) {
     $remain = [math]::Max(0.0, ($u.WeekResetAt - $now).TotalSeconds)
     $elapsed = $len - $remain
     $f = [pscustomobject]@{ Kind = 'early'; Elapsed = $elapsed; ProjUsed = $u.WeekUsed; RunOutAt = $null; Short = 'too early'; Long = 'Too early in the week to forecast' }
+    if ($u.WeekIdle) { $f.Short = 'not started'; $f.Long = 'No usage yet this week'; return $f }
     if ($u.LimitReached -or $u.WeekUsed -ge 100) {
         $f.Kind = 'out'; $f.RunOutAt = $now; $f.ProjUsed = 100
         $f.Short = 'limit hit'; $f.Long = "Limit reached - back at $(Format-When $u.WeekResetAt)"
@@ -266,13 +284,22 @@ function Get-Status($svc, $entry, [bool]$colorByPace) {
         if ($left -gt 50) { $color = $Colors.Green } elseif ($left -ge 20) { $color = $Colors.Amber } else { $color = $Colors.Red }
     }
 
-    $weekIn = Format-Span ($u.WeekResetAt - $now)
-    $menu = @("$($svc.Name) $($u.Plan): $left% left this week $Dot resets $(Format-When $u.WeekResetAt) ($weekIn)")
+    if ($u.WeekIdle) {
+        $weekIn = 'n/a'
+        $menu = @("$($svc.Name) $($u.Plan): $left% left this week $Dot no usage yet")
+    } else {
+        $weekIn = Format-Span ($u.WeekResetAt - $now)
+        $menu = @("$($svc.Name) $($u.Plan): $left% left this week $Dot resets $(Format-When $u.WeekResetAt) ($weekIn)")
+    }
     $five = ''
     if ($null -ne $u.FiveUsed) {
         $fl = Get-Left $u.FiveUsed
         $five = "5h $fl% | "
-        $menu += "      5-hour: $fl% left $Dot resets $(Format-When $u.FiveResetAt) ($(Format-Span ($u.FiveResetAt - $now)))"
+        if ($u.FiveResetAt) {
+            $menu += "      5-hour: $fl% left $Dot resets $(Format-When $u.FiveResetAt) ($(Format-Span ($u.FiveResetAt - $now)))"
+        } else {
+            $menu += "      5-hour: $fl% left $Dot no active window"
+        }
     }
 
     if ($entry.Error) {
@@ -280,7 +307,8 @@ function Get-Status($svc, $entry, [bool]$colorByPace) {
         $tip = @("$($svc.Name) $left% (old): $($entry.Error)")
         $menu += "      ! $($entry.Error) $Dot data from $($entry.LastOk.ToString('ddd HH:mm'))"
     } else {
-        $tip = @("$($svc.Name) $left% left, resets $weekIn", "   $($five)$($fc.Short)")
+        if ($u.WeekIdle) { $tip = @("$($svc.Name) $left% left, week not started", "   $($five)$($fc.Short)") }
+        else { $tip = @("$($svc.Name) $left% left, resets $weekIn", "   $($five)$($fc.Short)") }
         $menu += "      $($fc.Long)"
     }
 
@@ -599,7 +627,9 @@ function Render-Flyout {
         $mp = New-Object System.Drawing.Pen((C $th.Text), [single](2 * $S))
         $g.DrawLine($mp, $mx, [single]($y + 1 * $S), $mx, [single]($y + 17 * $S)); $mp.Dispose()
         $y += 20 * $S
-        Draw-Text $g "Resets $(Format-When $u.WeekResetAt) ($(Format-Span ($u.WeekResetAt - $now)))" $fSmall (C $th.Muted) $barX $y $barW
+        $resetLine = "Resets $(Format-When $u.WeekResetAt) ($(Format-Span ($u.WeekResetAt - $now)))"
+        if ($u.WeekIdle) { $resetLine = 'Weekly window starts with your first use' }
+        Draw-Text $g $resetLine $fSmall (C $th.Muted) $barX $y $barW
         $y += 17 * $S
         $fc = Get-Forecast $u
         $fcColor = C $th.Muted
@@ -616,7 +646,9 @@ function Render-Flyout {
             $fiveW = $barW - 92 * $S
             Draw-Text $g '5-hour' $fSmall (C $th.Muted) $pad $y (42 * $S)
             Draw-Bar $g $barX ($y + 6 * $S) $fiveW (6 * $S) $fl (C $fc) (C $th.Track)
-            Draw-Text $g "$fl% $Dot $(Format-Span ($u.FiveResetAt - $now))" $fSmall (C $th.Muted) ($barX + $fiveW + 6 * $S) $y (86 * $S) 'Far'
+            $fiveText = "$fl% $Dot idle"
+            if ($u.FiveResetAt) { $fiveText = "$fl% $Dot $(Format-Span ($u.FiveResetAt - $now))" }
+            Draw-Text $g $fiveText $fSmall (C $th.Muted) ($barX + $fiveW + 6 * $S) $y (86 * $S) 'Far'
             $y += 24 * $S
         }
 
@@ -653,7 +685,7 @@ function Test-Alerts($svc, $u) {
     $left = Get-Left $u.WeekUsed
     $note = $null
     # Reset times can jitter by a second; treat >1h later as a new week.
-    if ($reset -gt $st.resetAt + 3600) {
+    if (-not $u.WeekIdle -and $reset -gt $st.resetAt + 3600) {   # idle weeks have a moving placeholder reset
         if ($st.resetAt -gt 0) {
             $note = @{ Title = "$($svc.Name) weekly limit reset"; Text = "You have $left% of your weekly $($svc.Name) usage left." }
         }
@@ -798,7 +830,20 @@ function Set-TipText([System.Windows.Forms.NotifyIcon]$ni, [string]$text) {
 }
 
 function Get-AllStatus {
-    foreach ($svc in $Services) { Get-Status $svc $script:Data[$svc.Key] $script:State.colorByPace }
+    # A display error in one service shows as a gray "?" half instead of freezing the whole icon
+    foreach ($svc in $Services) {
+        try { Get-Status $svc $script:Data[$svc.Key] $script:State.colorByPace }
+        catch {
+            Write-LogOnce "status-$($svc.Key)" "Display error ($($svc.Name)): $_"
+            [pscustomobject]@{ Text = '?'; Color = $Colors.Gray; Tip = @("$($svc.Name): display error (see app.log)"); Menu = @("$($svc.Name): display error (see app.log)") }
+        }
+    }
+}
+
+# Logs a message only when it differs from the last one under the same key (stops 20-second repeats)
+$script:LogOnce = @{}
+function Write-LogOnce([string]$key, [string]$msg) {
+    if ($script:LogOnce[$key] -ne $msg) { Write-Log $msg; $script:LogOnce[$key] = $msg }
 }
 
 function Update-Icon {
@@ -868,7 +913,7 @@ function Complete-One([string]$key, $r) {
         $script:LastErr[$key] = $null
         $u = $r.Usage
         $entry.Usage = $u; $entry.Error = $null; $entry.LastOk = Get-Date
-        try { Add-History $svc $u } catch { Write-Log "Add-History failed: $_" }
+        if (-not $u.WeekIdle) { try { Add-History $svc $u } catch { Write-Log "Add-History failed: $_" } }
         $script:PendingNotes += @(Test-Alerts $svc $u)
         Save-State
         return
@@ -906,8 +951,8 @@ function Show-PendingNotes {
 }
 
 function Update-View {
-    try { Update-Icon } catch { Write-Log "Update-Icon failed: $_" }
-    try { if ($script:Flyout -and $script:Flyout.Visible) { Update-Flyout } } catch { Write-Log "Update-Flyout failed: $_" }
+    try { Update-Icon; $script:LogOnce['icon'] = $null } catch { Write-LogOnce 'icon' "Update-Icon failed: $_" }
+    try { if ($script:Flyout -and $script:Flyout.Visible) { Update-Flyout } } catch { Write-LogOnce 'flyout' "Update-Flyout failed: $_" }
 }
 
 function Update-All([bool]$fetch) {
