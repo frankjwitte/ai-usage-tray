@@ -1,12 +1,13 @@
 <#
   AI Usage Tray
-  One Windows tray icon showing how much of your weekly Claude Pro (top half) and
-  Codex Plus (bottom half) limits is left. It reads the logins that Claude Code and
-  Codex already keep on this machine and only reads them (never renews or changes them).
+  One Windows tray icon showing how much of your Claude, Codex and GitHub Copilot usage
+  limits is left (weekly for Claude/Codex, monthly premium requests for Copilot). It reads
+  the logins those tools already keep on this machine and only reads them (never renews or changes them).
+  Which services show is detected from those logins, or set in config.json (see Read-Config).
 
   Normally started by AiUsageTray.exe (gives the tray icon its own name in Windows).
   Direct run:  powershell -NoProfile -STA -ExecutionPolicy Bypass -File AiUsageTray.ps1
-  Test:        ... -File AiUsageTray.ps1 -Test [-TestOut <folder>]   (prints data, saves icon previews, exits)
+  Test:        ... -File AiUsageTray.ps1 -Test [-TestOut <folder>] [-Only copilot,codex]   (prints data, saves icon previews, exits)
   App icon:    ... -File AiUsageTray.ps1 -MakeIco <path.ico>
 #>
 param(
@@ -15,28 +16,39 @@ param(
     [string]$MakeIco,
     [switch]$DemoHistory,  # with -Test: live numbers plus a made-up chart history
     [switch]$Demo,         # with -Test: made-up numbers and history, no network (used for README screenshots)
+    [string[]]$Only,       # with -Test: show these services instead of the configured/detected ones
     [switch]$LibOnly      # internal: define functions only (used by the background fetch runspace)
 )
 
 $ErrorActionPreference = 'Stop'
 
 # ---------------- Settings ----------------
+# Defaults; config.json can override them (see Read-Config).
 $RefreshMinutes  = 5                 # how often to ask the services
-$AlertThresholds = @(50, 25, 10)     # notify when weekly % LEFT drops to these
+$AlertThresholds = @(50, 25, 10)     # notify when weekly/monthly % LEFT drops to these
 $FiveHourAlertAt = 10                # notify when a 5-hour window drops to this % left (once per window)
+$Defaults = @{ RefreshMinutes = $RefreshMinutes; AlertThresholds = $AlertThresholds; FiveHourAlertAt = $FiveHourAlertAt }
 $StateDir   = Join-Path $env:LOCALAPPDATA 'AiUsageTray'
 $StatePath  = Join-Path $StateDir 'state.json'
+$ConfigPath = Join-Path $StateDir 'config.json'
 $StartupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'AI Usage Tray.lnk'
 $ScriptPath = $MyInvocation.MyCommand.Path
 $UserHome   = $env:USERPROFILE
 
 $Colors = @{ Green = '#2E9E5B'; Amber = '#E8A317'; Red = '#D64545'; Gray = '#7A7A7A' }
 
-# Order matters: first = top half of the icon, second = bottom half
-$Services = @(
-    @{ Key = 'claude'; Name = 'Claude'; UsageUrl = 'https://claude.ai/settings/usage' },
-    @{ Key = 'codex';  Name = 'Codex';  UsageUrl = 'https://chatgpt.com/codex/settings/usage' }
+# Every supported service. Logins = files whose presence means "signed in on this machine" (auto-detect).
+# The active list ($Services) comes from Update-ActiveServices; its first two go on the icon (top, bottom).
+$AllServices = @(
+    @{ Key = 'claude';  Name = 'Claude';  Fetch = 'Get-ClaudeUsage';  UsageUrl = 'https://claude.ai/settings/usage'
+       Logins = @((Join-Path $UserHome '.claude\.credentials.json')) },
+    @{ Key = 'codex';   Name = 'Codex';   Fetch = 'Get-CodexUsage';   UsageUrl = 'https://chatgpt.com/codex/settings/usage'
+       Logins = @((Join-Path $UserHome '.codex\auth.json')) },
+    @{ Key = 'copilot'; Name = 'Copilot'; Fetch = 'Get-CopilotUsage'; UsageUrl = 'https://github.com/settings/copilot'
+       Logins = @((Join-Path $env:LOCALAPPDATA 'github-copilot\apps.json'), (Join-Path $env:LOCALAPPDATA 'github-copilot\hosts.json')) }
 )
+$DefaultServices = @('claude', 'codex')   # shown when nothing is configured or detected
+$Services = @()
 
 # Diagnostic log (rotates at 256 KB): %LOCALAPPDATA%\AiUsageTray\app.log
 $LogPath = Join-Path $StateDir 'app.log'
@@ -47,6 +59,75 @@ function Write-Log([string]$msg) {
         [IO.File]::AppendAllText($LogPath, "$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))  $msg`r`n")
     } catch {}
 }
+
+# Logs a message only when it differs from the last one under the same key (stops 20-second repeats)
+$script:LogOnce = @{}
+function Write-LogOnce([string]$key, [string]$msg) {
+    if ($script:LogOnce[$key] -ne $msg) { Write-Log $msg; $script:LogOnce[$key] = $msg }
+}
+
+# ---------------- Config (optional) ----------------
+# %LOCALAPPDATA%\AiUsageTray\config.json, every key optional:
+#   { "services": ["copilot", "codex"], "refreshMinutes": 5, "alertThresholds": [50, 25, 10], "fiveHourAlertAt": 10 }
+# No "services" = show every service that has a login on this machine. Re-read before each refresh.
+function Read-Config {
+    $c = $null
+    if (Test-Path $ConfigPath) {
+        try {
+            $raw = Get-Content $ConfigPath -Raw
+            if ($raw -and $raw.Trim()) { $c = $raw | ConvertFrom-Json }
+            $script:LogOnce['config'] = $null
+        } catch { Write-LogOnce 'config' "config.json unreadable, using defaults: $_" }
+    }
+    $script:Config = $c
+    $script:RefreshMinutes = $Defaults.RefreshMinutes
+    $script:AlertThresholds = $Defaults.AlertThresholds
+    $script:FiveHourAlertAt = $Defaults.FiveHourAlertAt
+    if (-not $c) { return }
+    if ($c.refreshMinutes -ge 1) { $script:RefreshMinutes = [int]$c.refreshMinutes }
+    if ($c.alertThresholds) { $script:AlertThresholds = @($c.alertThresholds | ForEach-Object { [int]$_ }) }
+    if ($null -ne $c.fiveHourAlertAt) { $script:FiveHourAlertAt = [int]$c.fiveHourAlertAt }
+}
+
+# Writes the "services" list into config.json, keeping its other keys. $null = back to auto-detect.
+function Save-ConfigServices($keys) {
+    $c = [pscustomobject]@{}
+    if (Test-Path $ConfigPath) {
+        $raw = Get-Content $ConfigPath -Raw
+        if ($raw -and $raw.Trim()) { $c = $raw | ConvertFrom-Json }   # throws on bad JSON: don't overwrite the user's file
+    }
+    $c.PSObject.Properties.Remove('services')
+    if ($keys) { $c | Add-Member -NotePropertyName services -NotePropertyValue @($keys) }
+    if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir | Out-Null }
+    $c | ConvertTo-Json -Depth 4 | Set-Content -Path $ConfigPath -Encoding UTF8
+}
+
+function Test-ServiceLogin($svc) { return @($svc.Logins | Where-Object { Test-Path $_ }).Count -gt 0 }
+
+# -Only (tests) > config.json "services" > services with a login here > Claude + Codex
+function Get-ServiceKeys {
+    $known = @($AllServices | ForEach-Object { $_.Key })
+    $keys = @()
+    if ($Only) { $keys = @($Only | ForEach-Object { $_ -split ',' }) }
+    elseif ($script:Config -and $script:Config.services) { $keys = @($script:Config.services) }
+    $keys = @($keys | ForEach-Object { ([string]$_).Trim().ToLower() } | Where-Object { $_ })
+    $bad = @($keys | Where-Object { $known -notcontains $_ })
+    if ($bad.Count) { Write-LogOnce 'svc-unknown' "Unknown service(s) ignored: $($bad -join ', ') (known: $($known -join ', '))" }
+    $keys = @($keys | Where-Object { $known -contains $_ } | Select-Object -Unique)
+    if ($keys.Count -eq 0) { $keys = @($AllServices | Where-Object { Test-ServiceLogin $_ } | ForEach-Object { $_.Key }) }
+    if ($keys.Count -eq 0) { $keys = $DefaultServices }
+    return $keys
+}
+
+function Update-ActiveServices {
+    $keys = @(Get-ServiceKeys)
+    $old = @($script:Services | ForEach-Object { $_.Key }) -join ', '
+    $script:Services = @(foreach ($k in $keys) { $AllServices | Where-Object { $_.Key -eq $k } })
+    if ($old -and $old -ne ($keys -join ', ')) { Write-Log "Services: $($keys -join ', ')" }
+}
+
+Read-Config
+Update-ActiveServices
 
 # ---------------- Setup ----------------
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -193,9 +274,84 @@ function Get-CodexUsage {
     return (Set-WeekIdle $u)
 }
 
-function Get-Usage([string]$Key) {
-    if ($Key -eq 'claude') { return Get-ClaudeUsage } else { return Get-CodexUsage }
+# GitHub OAuth token from the Copilot editor plugins (JetBrains, Vim, ...), else from the GitHub CLI.
+# VS Code and the Copilot CLI keep theirs in Windows Credential Manager, which this doesn't read.
+function Get-CopilotToken {
+    foreach ($f in 'apps.json', 'hosts.json') {
+        $p = Join-Path $env:LOCALAPPDATA "github-copilot\$f"
+        if (-not (Test-Path $p)) { continue }
+        $j = Get-Content $p -Raw | ConvertFrom-Json
+        foreach ($prop in $j.PSObject.Properties) {
+            if ($prop.Name -like 'github.com*' -and $prop.Value.oauth_token) { return [string]$prop.Value.oauth_token }
+        }
+    }
+    $gh = Get-Command gh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($gh) {
+        try {
+            # No console window: the exe host has no console, so a plain call would flash one
+            $psi = New-Object Diagnostics.ProcessStartInfo($gh.Source, 'auth token --hostname github.com')
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $p = [Diagnostics.Process]::Start($psi)
+            $out = $p.StandardOutput.ReadToEnd()
+            if (-not $p.WaitForExit(10000)) { try { $p.Kill() } catch {}; return $null }
+            if ($p.ExitCode -eq 0 -and $out.Trim()) { return $out.Trim() }
+        } catch {}
+    }
+    return $null
 }
+
+# Copilot has a monthly premium-request allowance (resets on the 1st, UTC) and no 5-hour window.
+function Get-CopilotUsage {
+    $tok = Get-CopilotToken
+    if (-not $tok) { throw 'Not logged in - sign in to Copilot' }
+    $r = Invoke-Usage 'https://api.github.com/copilot_internal/user' @{
+        Authorization = "token $tok"
+        Accept        = 'application/json'
+        'User-Agent'  = 'AiUsageTray'
+    } 'sign in to Copilot'
+
+    $q = $null; if ($r.quota_snapshots) { $q = $r.quota_snapshots.premium_interactions }
+    if (-not $q) { throw 'No premium request quota in response' }
+    if ($q.unlimited) { $used = 0.0 }
+    elseif ($null -ne $q.percent_remaining) { $used = 100.0 - [double]$q.percent_remaining }
+    elseif ([double]$q.entitlement -gt 0) { $used = 100.0 * (1 - [double]$q.remaining / [double]$q.entitlement) }
+    else { throw 'No premium request quota in response' }
+
+    $reset = ConvertTo-Dto $r.quota_reset_date_utc
+    if (-not $reset -and $r.quota_reset_date) { $reset = ConvertTo-Dto "$($r.quota_reset_date)T00:00:00Z" }
+    $len = 30 * 86400
+    if ($reset) { $len = [int64]($reset - $reset.AddMonths(-1)).TotalSeconds }
+
+    $plan = 'Copilot'
+    if ($r.copilot_plan) {
+        $plan = switch ([string]$r.copilot_plan) {
+            'individual'     { 'Pro' }
+            'individual_pro' { 'Pro+' }
+            default          { (Get-Culture).TextInfo.ToTitleCase(([string]$r.copilot_plan).Replace('_', ' ')) }
+        }
+    }
+    $u = [pscustomobject]@{
+        Plan = $plan
+        WeekUsed = $used
+        WeekResetAt = $reset
+        WeekSeconds = $len
+        WeekIdle = $false
+        FiveUsed = $null; FiveResetAt = $null
+        LimitReached = ($used -ge 100)
+    }
+    return (Set-WeekIdle $u)
+}
+
+function Get-Usage([string]$Key) {
+    $svc = $AllServices | Where-Object { $_.Key -eq $Key }
+    if (-not $svc) { throw "Unknown service '$Key'" }
+    return (& $svc.Fetch)
+}
+
+# The main window is weekly for Claude/Codex and monthly for Copilot. ("Week*" fields hold either.)
+function Get-PeriodName($u) { if ($u.WeekSeconds -gt 10 * 86400) { return 'month' } else { return 'week' } }
+function Get-PeriodAdj($u)  { if ($u.WeekSeconds -gt 10 * 86400) { return 'monthly' } else { return 'weekly' } }
 
 # ---------------- Presentation ----------------
 function Format-Span([TimeSpan]$ts) {
@@ -208,6 +364,7 @@ function Format-Span([TimeSpan]$ts) {
 function Format-When([DateTimeOffset]$t) {
     $local = $t.LocalDateTime
     if ($local.Date -eq (Get-Date).Date) { return $local.ToString('HH:mm') }
+    if ([math]::Abs(($local - (Get-Date)).TotalDays) -ge 6) { return $local.ToString('MMM d HH:mm') }   # weekday alone is ambiguous
     return $local.ToString('ddd HH:mm')
 }
 
@@ -232,14 +389,15 @@ function Get-Forecast($u) {
     $len = [double]$u.WeekSeconds
     $remain = [math]::Max(0.0, ($u.WeekResetAt - $now).TotalSeconds)
     $elapsed = $len - $remain
-    $f = [pscustomobject]@{ Kind = 'early'; Elapsed = $elapsed; ProjUsed = $u.WeekUsed; RunOutAt = $null; Short = 'too early'; Long = 'Too early in the week to forecast' }
-    if ($u.WeekIdle) { $f.Short = 'not started'; $f.Long = 'No usage yet this week'; return $f }
+    $p = Get-PeriodName $u
+    $f = [pscustomobject]@{ Kind = 'early'; Elapsed = $elapsed; ProjUsed = $u.WeekUsed; RunOutAt = $null; Short = 'too early'; Long = "Too early in the $p to forecast" }
+    if ($u.WeekIdle) { $f.Short = 'not started'; $f.Long = "No usage yet this $p"; return $f }
     if ($u.LimitReached -or $u.WeekUsed -ge 100) {
         $f.Kind = 'out'; $f.RunOutAt = $now; $f.ProjUsed = 100
         $f.Short = 'limit hit'; $f.Long = "Limit reached - back at $(Format-When $u.WeekResetAt)"
         return $f
     }
-    if ($elapsed -lt 12 * 3600) { return $f }
+    if ($elapsed -lt [math]::Max(12 * 3600, 0.07 * $len)) { return $f }   # 12h for a week, ~2 days for a month
     $rate = $u.WeekUsed / $elapsed                       # % per second
     $proj = $u.WeekUsed + $rate * $remain
     $f.ProjUsed = [math]::Min(100.0, $proj)
@@ -284,12 +442,13 @@ function Get-Status($svc, $entry, [bool]$colorByPace) {
         if ($left -gt 50) { $color = $Colors.Green } elseif ($left -ge 20) { $color = $Colors.Amber } else { $color = $Colors.Red }
     }
 
+    $p = Get-PeriodName $u
     if ($u.WeekIdle) {
         $weekIn = 'n/a'
-        $menu = @("$($svc.Name) $($u.Plan): $left% left this week $Dot no usage yet")
+        $menu = @("$($svc.Name) $($u.Plan): $left% left this $p $Dot no usage yet")
     } else {
         $weekIn = Format-Span ($u.WeekResetAt - $now)
-        $menu = @("$($svc.Name) $($u.Plan): $left% left this week $Dot resets $(Format-When $u.WeekResetAt) ($weekIn)")
+        $menu = @("$($svc.Name) $($u.Plan): $left% left this $p $Dot resets $(Format-When $u.WeekResetAt) ($weekIn)")
     }
     $five = ''
     if ($null -ne $u.FiveUsed) {
@@ -307,7 +466,7 @@ function Get-Status($svc, $entry, [bool]$colorByPace) {
         $tip = @("$($svc.Name) $left% (old): $($entry.Error)")
         $menu += "      ! $($entry.Error) $Dot data from $($entry.LastOk.ToString('ddd HH:mm'))"
     } else {
-        if ($u.WeekIdle) { $tip = @("$($svc.Name) $left% left, week not started", "   $($five)$($fc.Short)") }
+        if ($u.WeekIdle) { $tip = @("$($svc.Name) $left% left, $p not started", "   $($five)$($fc.Short)") }
         else { $tip = @("$($svc.Name) $left% left, resets $weekIn", "   $($five)$($fc.Short)") }
         $menu += "      $($fc.Long)"
     }
@@ -316,6 +475,14 @@ function Get-Status($svc, $entry, [bool]$colorByPace) {
         Text = [string]([math]::Min(99, $left))   # 2 digits fit; 100 shows as 99
         Color = $color; Tip = $tip; Menu = $menu
     }
+}
+
+# Tooltip: two lines per service, or just the first line each with 3+ services (127-char limit)
+function Get-TipText($st, $updated) {
+    $st = @($st); $lines = @()
+    foreach ($s in $st) { if ($st.Count -gt 2) { $lines += @($s.Tip)[0] } else { $lines += @($s.Tip) } }
+    if ($updated) { $lines += "Updated $($updated.ToString('HH:mm'))" }
+    return ($lines -join "`n")
 }
 
 # ---------------- Icon drawing ----------------
@@ -354,8 +521,8 @@ function Draw-Number($g, [string]$text, [System.Drawing.RectangleF]$rect, [Syste
     $br.Dispose(); $font.Dispose()
 }
 
-# Split icon: top half = first service, bottom half = second
-function New-ComboBitmap($top, $bottom, [int]$size) {
+# Split icon: top half = first service, bottom half = second. One service fills the whole icon.
+function New-ComboBitmap([object[]]$parts, [int]$size) {
     $bmp = New-Object System.Drawing.Bitmap($size, $size)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
@@ -367,16 +534,27 @@ function New-ComboBitmap($top, $bottom, [int]$size) {
     $outer.AddArc($w - $d, $w - $d, $d, $d, 0, 90); $outer.AddArc(0, $w - $d, $d, $d, 90, 90)
     $outer.CloseFigure()
 
-    $half = [int]($size / 2)
+    $top = $parts[0]; $padX = 1; $tw = $size - 2 * $padX - 1
     $g.SetClip($outer)
+    if ($parts.Count -lt 2) {
+        $b1 = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($top.Color))
+        $g.FillRectangle($b1, 0, 0, $size, $size)
+        $g.ResetClip(); $b1.Dispose(); $outer.Dispose()
+        $padY = [int]($size * 0.22)
+        Draw-Number $g $top.Text ([System.Drawing.RectangleF]::new($padX, $padY, $tw, $size - 2 * $padY)) (Get-TextColor $top.Color)
+        $g.Dispose()
+        return $bmp
+    }
+    $bottom = $parts[1]
+    $half = [int]($size / 2)
     $b1 = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($top.Color))
     $b2 = New-Object System.Drawing.SolidBrush([System.Drawing.ColorTranslator]::FromHtml($bottom.Color))
     $g.FillRectangle($b1, 0, 0, $size, $half)
     $g.FillRectangle($b2, 0, $half, $size, $size - $half)
     $g.ResetClip(); $b1.Dispose(); $b2.Dispose(); $outer.Dispose()
 
-    $padX = 1; $padY = [math]::Max(1, [int]($size / 10))
-    $h = $half - 2 * $padY + 1; $tw = $size - 2 * $padX - 1; $y2 = $half + $padY - 1
+    $padY = [math]::Max(1, [int]($size / 10))
+    $h = $half - 2 * $padY + 1; $y2 = $half + $padY - 1
     Draw-Number $g $top.Text    ([System.Drawing.RectangleF]::new($padX, $padY, $tw, $h)) (Get-TextColor $top.Color)
     Draw-Number $g $bottom.Text ([System.Drawing.RectangleF]::new($padX, $y2,    $tw, $h)) (Get-TextColor $bottom.Color)
     $g.Dispose()
@@ -388,7 +566,7 @@ function Save-Ico([string]$path) {
     $top = [pscustomobject]@{ Text = 'AI'; Color = $Colors.Green }
     $bot = [pscustomobject]@{ Text = '%';  Color = $Colors.Amber }
     $pngs = foreach ($sz in 16, 20, 24, 32, 48, 64, 256) {
-        $bmp = New-ComboBitmap $top $bot $sz
+        $bmp = New-ComboBitmap @($top, $bot) $sz
         $ms = New-Object IO.MemoryStream; $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
         , @($sz, $ms.ToArray())
     }
@@ -408,12 +586,13 @@ function Save-Ico([string]$path) {
 # ---------------- State (settings + alert memory) ----------------
 function Get-State {
     $s = @{ colorByPace = $false }
-    foreach ($k in 'claude', 'codex') { $s[$k] = @{ resetAt = 0; fired = @(); fiveFired = $false } }
+    $keys = @($AllServices | ForEach-Object { $_.Key })   # all, so switching services on later keeps alert memory
+    foreach ($k in $keys) { $s[$k] = @{ resetAt = 0; fired = @(); fiveFired = $false } }
     if (Test-Path $StatePath) {
         try {
             $j = Get-Content $StatePath -Raw | ConvertFrom-Json
             if ($null -ne $j.colorByPace) { $s.colorByPace = [bool]$j.colorByPace }
-            foreach ($k in 'claude', 'codex') {
+            foreach ($k in $keys) {
                 if ($j.$k) {
                     $s[$k].resetAt = [int64]$j.$k.resetAt
                     $s[$k].fired = @($j.$k.fired | ForEach-Object { [int]$_ })
@@ -430,7 +609,7 @@ function Save-State {
     $script:State | ConvertTo-Json -Depth 4 | Set-Content -Path $StatePath -Encoding UTF8
 }
 
-# ---------------- History (for the weekly chart) ----------------
+# ---------------- History (for the usage chart) ----------------
 # history.csv rows: unixTime,service,weekUsedPercent,weekResetUnix
 $HistoryPath = Join-Path $StateDir 'history.csv'
 $script:History = New-Object System.Collections.Generic.List[object]
@@ -438,7 +617,7 @@ $Inv = [Globalization.CultureInfo]::InvariantCulture
 
 function Import-History([switch]$NoPrune) {
     if (-not (Test-Path $HistoryPath)) { return }
-    $cut = [DateTimeOffset]::UtcNow.AddDays(-21).ToUnixTimeSeconds()
+    $cut = [DateTimeOffset]::UtcNow.AddDays(-40).ToUnixTimeSeconds()   # a monthly window plus margin
     $keep = New-Object System.Collections.Generic.List[string]
     foreach ($line in [IO.File]::ReadAllLines($HistoryPath)) {
         $p = $line.Split(',')
@@ -450,7 +629,7 @@ function Import-History([switch]$NoPrune) {
         $script:History.Add([pscustomobject]@{ T = $t; Key = $p[1]; Used = $used; Reset = $reset })
         $keep.Add($line)
     }
-    if (-not $NoPrune) { [IO.File]::WriteAllLines($HistoryPath, $keep) }   # drop rows older than 3 weeks
+    if (-not $NoPrune) { [IO.File]::WriteAllLines($HistoryPath, $keep) }   # drop rows older than 40 days
 }
 
 function Add-History($svc, $u) {
@@ -526,10 +705,12 @@ function Draw-WeekChart($g, $svc, $u, [double]$x, [double]$y, [double]$w, [doubl
     $nowT = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
     Fill-Path $g (New-RoundPath $x $y $w $h (4 * $S)) ([System.Drawing.Color]::FromArgb(18, (C $th.Text)))
-    # day dividers
+    # day dividers (week dividers for a monthly window)
+    $month = (Get-PeriodName $u) -eq 'month'
+    $step = 86400; if ($month) { $step = 7 * 86400 }
     $gp = New-Object System.Drawing.Pen((C $th.Grid), [single]1)
-    for ($d = 1; $d -lt [math]::Round($len / 86400); $d++) {
-        $dx = [single]($x + $w * ($d * 86400) / $len)
+    for ($t = $step; $t -lt $len - 3600; $t += $step) {
+        $dx = [single]($x + $w * $t / $len)
         $g.DrawLine($gp, $dx, [single]($y + 2 * $S), $dx, [single]($y + $h - 2 * $S))
     }
     $gp.Dispose()
@@ -574,16 +755,17 @@ function Draw-WeekChart($g, $svc, $u, [double]$x, [double]$y, [double]$w, [doubl
 
     $ly = $y + $h + 2 * $S
     $startLocal = [DateTimeOffset]::FromUnixTimeSeconds($start).LocalDateTime
-    Draw-Text $g $startLocal.ToString('ddd') $font (C $th.Muted) $x $ly ($w / 3) 'Near'
+    $dayFmt = 'ddd'; if ($month) { $dayFmt = 'MMM d' }
+    Draw-Text $g $startLocal.ToString($dayFmt) $font (C $th.Muted) $x $ly ($w / 3) 'Near'
     Draw-Text $g "used  $Dot  ... forecast  $Dot  - - even pace" $font (C $th.Muted) ($x + $w / 8) $ly ($w * 3 / 4) 'Center'
-    Draw-Text $g $u.WeekResetAt.LocalDateTime.ToString('ddd') $font (C $th.Muted) ($x + 2 * $w / 3) $ly ($w / 3) 'Far'
+    Draw-Text $g $u.WeekResetAt.LocalDateTime.ToString($dayFmt) $font (C $th.Muted) ($x + 2 * $w / 3) $ly ($w / 3) 'Far'
 }
 
 # Draws the whole panel into a bitmap; returns @{ Bitmap; Hits; Theme }
 function Render-Flyout {
     $S = $script:Scale; $th = Get-Theme
     $W = [int](340 * $S); $pad = 16 * $S
-    $bmp = New-Object System.Drawing.Bitmap($W, [int](900 * $S))
+    $bmp = New-Object System.Drawing.Bitmap($W, [int]((100 + 300 * $Services.Count) * $S))   # cropped to fit below
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
@@ -620,15 +802,15 @@ function Render-Flyout {
 
         $left = Get-Left $u.WeekUsed; $pace = Get-Pace $u
         $barX = $pad + 44 * $S; $barW = $W - $pad - $barX
-        # Week: bar = % left; tick = where % left would be at an even pace
-        Draw-Text $g 'Week' $fSmall (C $th.Muted) $pad $y (42 * $S)
+        # Week (or month): bar = % left; tick = where % left would be at an even pace
+        Draw-Text $g ((Get-Culture).TextInfo.ToTitleCase((Get-PeriodName $u))) $fSmall (C $th.Muted) $pad $y (42 * $S)
         Draw-Bar $g $barX ($y + 4 * $S) $barW (10 * $S) $left (C $st.Color) (C $th.Track)
         $mx = [single]($barX + $barW * (100 - $pace.ElapsedPct) / 100)
         $mp = New-Object System.Drawing.Pen((C $th.Text), [single](2 * $S))
         $g.DrawLine($mp, $mx, [single]($y + 1 * $S), $mx, [single]($y + 17 * $S)); $mp.Dispose()
         $y += 20 * $S
         $resetLine = "Resets $(Format-When $u.WeekResetAt) ($(Format-Span ($u.WeekResetAt - $now)))"
-        if ($u.WeekIdle) { $resetLine = 'Weekly window starts with your first use' }
+        if ($u.WeekIdle) { $resetLine = "$((Get-Culture).TextInfo.ToTitleCase((Get-PeriodAdj $u))) window starts with your first use" }
         Draw-Text $g $resetLine $fSmall (C $th.Muted) $barX $y $barW
         $y += 17 * $S
         $fc = Get-Forecast $u
@@ -683,11 +865,12 @@ function Test-Alerts($svc, $u) {
     $st = $script:State[$svc.Key]
     $reset = $u.WeekResetAt.ToUnixTimeSeconds()
     $left = Get-Left $u.WeekUsed
+    $adj = Get-PeriodAdj $u
     $note = $null
     # Reset times can jitter by a second; treat >1h later as a new week.
     if (-not $u.WeekIdle -and $reset -gt $st.resetAt + 3600) {   # idle weeks have a moving placeholder reset
         if ($st.resetAt -gt 0) {
-            $note = @{ Title = "$($svc.Name) weekly limit reset"; Text = "You have $left% of your weekly $($svc.Name) usage left." }
+            $note = @{ Title = "$($svc.Name) $adj limit reset"; Text = "You have $left% of your $adj $($svc.Name) usage left." }
         }
         $st.resetAt = $reset; $st.fired = @()
     }
@@ -695,17 +878,17 @@ function Test-Alerts($svc, $u) {
     if ($crossed.Count -gt 0) {
         $st.fired = @($st.fired + $crossed)
         $note = @{
-            Title = "$($svc.Name): $left% of weekly limit left"
+            Title = "$($svc.Name): $left% of $adj limit left"
             Text  = "Resets in $(Format-Span ($u.WeekResetAt - [DateTimeOffset]::UtcNow))."
         }
     }
-    # Once per week: warn when the forecast first says it runs out (after a day of data)
+    # Once per window: warn when the forecast first says it runs out (after a day of data; 3 for a month)
     $fc = Get-Forecast $u
-    if (-not $note -and $fc.Kind -eq 'out' -and -not $u.LimitReached -and $fc.Elapsed -ge 86400 -and $st.fired -notcontains -1) {
+    if (-not $note -and $fc.Kind -eq 'out' -and -not $u.LimitReached -and $fc.Elapsed -ge [math]::Max(86400, 0.1 * $u.WeekSeconds) -and $st.fired -notcontains -1) {
         $st.fired = @($st.fired + -1)
         $note = @{
             Title = "$($svc.Name) may run out before reset"
-            Text  = "At your pace so far it runs out around $(Format-When $fc.RunOutAt), $(Format-Span ($u.WeekResetAt - $fc.RunOutAt)) before the weekly reset."
+            Text  = "At your pace so far it runs out around $(Format-When $fc.RunOutAt), $(Format-Span ($u.WeekResetAt - $fc.RunOutAt)) before the $adj reset."
         }
     }
 
@@ -738,6 +921,14 @@ function New-DemoUsage([string]$key) {
         return [pscustomobject]@{ Plan = 'Pro'; WeekUsed = 31.0; WeekResetAt = $now.AddDays(3.8); WeekSeconds = 604800
                                   FiveUsed = 41.0; FiveResetAt = $now.AddMinutes(134); LimitReached = $false }
     }
+    if ($key -eq 'copilot') {
+        # Monthly, resets on the 1st (UTC). Used % runs a bit behind the elapsed share of the month.
+        $reset = [DateTimeOffset]::new($now.Year, $now.Month, 1, 0, 0, 0, [TimeSpan]::Zero).AddMonths(1)
+        $len = ($reset - $reset.AddMonths(-1)).TotalSeconds
+        $used = [math]::Round(100.0 * (1 - ($reset - $now).TotalSeconds / $len) * 0.8 + 1, 1)
+        return [pscustomobject]@{ Plan = 'Business'; WeekUsed = $used; WeekResetAt = $reset; WeekSeconds = [int64]$len
+                                  FiveUsed = $null; FiveResetAt = $null; LimitReached = $false }
+    }
     return [pscustomobject]@{ Plan = 'Plus'; WeekUsed = 58.0; WeekResetAt = $now.AddDays(4.3); WeekSeconds = 604800
                               FiveUsed = 12.0; FiveResetAt = $now.AddMinutes(201); LimitReached = $false }
 }
@@ -768,6 +959,8 @@ function Add-DemoHistory([string]$key, $u) {
 if ($Test) {
     New-Item -ItemType Directory -Force -Path $TestOut | Out-Null
     $script:Data = @{}; $script:LastUpdate = Get-Date
+    if ($Demo -and -not $Only) { $Only = $DefaultServices; Update-ActiveServices }   # same screenshots on every machine
+    "Services: $(@($Services | ForEach-Object { $_.Key }) -join ', ')"
     if ($Demo) {
         $script:State = @{ colorByPace = $false }   # don't use the real setting for screenshots
         $script:Scale = 2.0                          # crisp on high-DPI displays; README shows it at half size
@@ -784,11 +977,11 @@ if ($Test) {
         $script:Data[$svc.Key] = $entry
     }
     $st = @(foreach ($svc in $Services) { Get-Status $svc $script:Data[$svc.Key] $script:State.colorByPace })
-    $tip = (@($st[0].Tip) + @($st[1].Tip) + "Updated $($script:LastUpdate.ToString('HH:mm'))") -join "`n"
+    $tip = Get-TipText $st $script:LastUpdate
     "----- Tooltip ($($tip.Length)/127 chars)"; $tip
-    "----- Menu"; $st[0].Menu; $st[1].Menu
+    "----- Menu"; foreach ($s in $st) { $s.Menu }
     $size = [System.Windows.Forms.SystemInformation]::SmallIconSize.Width
-    $bmp = New-ComboBitmap $st[0] $st[1] $size
+    $bmp = New-ComboBitmap @($st | Select-Object -First 2) $size
     $big = New-Object System.Drawing.Bitmap(($size * 8), ($size * 8))
     $g = [System.Drawing.Graphics]::FromImage($big)
     $g.InterpolationMode = 'NearestNeighbor'; $g.PixelOffsetMode = 'Half'
@@ -840,25 +1033,17 @@ function Get-AllStatus {
     }
 }
 
-# Logs a message only when it differs from the last one under the same key (stops 20-second repeats)
-$script:LogOnce = @{}
-function Write-LogOnce([string]$key, [string]$msg) {
-    if ($script:LogOnce[$key] -ne $msg) { Write-Log $msg; $script:LogOnce[$key] = $msg }
-}
-
 function Update-Icon {
     $st = @(Get-AllStatus)
     $size = [System.Windows.Forms.SystemInformation]::SmallIconSize.Width
     if ($size -lt 16) { $size = 16 }
-    $bmp = New-ComboBitmap $st[0] $st[1] $size
+    $bmp = New-ComboBitmap @($st | Select-Object -First 2) $size
     $h = $bmp.GetHicon(); $bmp.Dispose()
     $old = $script:IconHandle
     $script:Tray.Icon = [System.Drawing.Icon]::FromHandle($h)
     $script:IconHandle = $h
     if ($old -ne [IntPtr]::Zero) { [void][AiTrayNative]::DestroyIcon($old) }
-    $lines = @($st[0].Tip) + @($st[1].Tip)
-    if ($script:LastUpdate) { $lines += "Updated $($script:LastUpdate.ToString('HH:mm'))" }
-    Set-TipText $script:Tray ($lines -join "`n")
+    Set-TipText $script:Tray (Get-TipText $st $script:LastUpdate)
 }
 
 # Fetching runs in background runspaces (one per service) so a slow or hung network never
@@ -882,6 +1067,8 @@ function Get-BgRunspace([string]$key) {
 function Start-Fetch {
     $script:LastFetch = Get-Date
     $script:RetrySoon = $false
+    # Pick up config.json edits and new logins (e.g. Copilot signed in since startup)
+    try { Read-Config; Update-ActiveServices } catch { Write-LogOnce 'services' "Updating services failed: $_" }
     foreach ($svc in $Services) {
         $k = $svc.Key
         if ($script:Jobs[$k]) { continue }                                                  # still running
@@ -902,7 +1089,7 @@ function Start-Fetch {
 }
 
 function Complete-One([string]$key, $r) {
-    $svc = $Services | Where-Object { $_.Key -eq $key }
+    $svc = $AllServices | Where-Object { $_.Key -eq $key }   # may have been switched off while fetching
     $entry = $script:Data[$key]
     if (-not $entry) { $entry = @{ Usage = $null; Error = $null; LastOk = (Get-Date) }; $script:Data[$key] = $entry }
     $msg = $null
@@ -1025,6 +1212,27 @@ function Find-Hit($pt) {
     return $null
 }
 
+# Menu: turn a service on (appended, so it goes last) or off. Saves an explicit list to config.json.
+function Switch-Service([string]$key) {
+    $keys = @($Services | ForEach-Object { $_.Key })
+    if ($keys -contains $key) {
+        if ($keys.Count -le 1) { return }   # keep at least one
+        $keys = @($keys | Where-Object { $_ -ne $key })
+    } else { $keys += $key }
+    Save-ConfigServices $keys
+    Update-All $true
+}
+
+function Open-Config {
+    if (-not (Test-Path $ConfigPath)) {
+        if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Path $StateDir | Out-Null }
+        # No "services" key, so it stays on auto-detect until the user adds one
+        [ordered]@{ refreshMinutes = $RefreshMinutes; alertThresholds = $AlertThresholds; fiveHourAlertAt = $FiveHourAlertAt } |
+            ConvertTo-Json -Depth 4 | Set-Content -Path $ConfigPath -Encoding UTF8
+    }
+    Start-Process notepad.exe -ArgumentList "`"$ConfigPath`""
+}
+
 function Set-Startup([bool]$on) {
     if ($on) {
         $sh = New-Object -ComObject WScript.Shell
@@ -1068,6 +1276,28 @@ $menu.add_Opening({
     $mp.Checked = $script:State.colorByPace
     $mp.add_Click({ $script:State.colorByPace = -not $script:State.colorByPace; Save-State; Update-All $false })
     [void]$menu.Items.Add($mp)
+    # Services submenu: one checkbox per service, plus "Automatic" (= no "services" in config.json)
+    $mv = New-Object System.Windows.Forms.ToolStripMenuItem('Services')
+    $explicit = [bool]($script:Config -and $script:Config.services)
+    $ma = New-Object System.Windows.Forms.ToolStripMenuItem('Automatic (tools signed in here)')
+    $ma.Checked = -not $explicit
+    $ma.add_Click({ try { Save-ConfigServices $null; Update-All $true } catch { Write-Log "Saving config.json failed: $_" } })
+    [void]$mv.DropDownItems.Add($ma)
+    [void]$mv.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $activeKeys = @($Services | ForEach-Object { $_.Key })
+    foreach ($svc in $AllServices) {
+        $label = $svc.Name; if (-not (Test-ServiceLogin $svc)) { $label += ' (no login found)' }
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem($label)
+        $mi.Checked = $activeKeys -contains $svc.Key
+        $mi.Tag = $svc.Key
+        $mi.add_Click({ param($s, $e) try { Switch-Service $s.Tag } catch { Write-Log "Saving config.json failed: $_" } })
+        [void]$mv.DropDownItems.Add($mi)
+    }
+    [void]$mv.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    $mo = $mv.DropDownItems.Add('Edit config.json...')
+    $mo.ToolTipText = 'Order (first two go on the icon), refresh interval, alert levels. Applies at the next refresh.'
+    $mo.add_Click({ try { Open-Config } catch { Write-Log "Open config failed: $_" } })
+    [void]$menu.Items.Add($mv)
     $ms = New-Object System.Windows.Forms.ToolStripMenuItem('Start with Windows')
     $ms.Checked = Test-Path $StartupLnk
     $ms.add_Click({ param($s, $e) try { Set-Startup (-not $s.Checked) } catch { Write-Log "Set-Startup failed: $_" } })

@@ -1,6 +1,6 @@
 # AI Usage Tray — notes for Claude
 
-Windows tray app showing weekly Claude + Codex usage left. User-facing docs: `README.md`.
+Windows tray app showing usage left for Claude, Codex (weekly) and GitHub Copilot (monthly premium requests). User-facing docs: `README.md`.
 
 ## Layout
 - `AiUsageTray.ps1` — the whole app. Windows PowerShell **5.1** / .NET Framework (no PS7 syntax: no `?:`, `??`, `&&`).
@@ -9,9 +9,12 @@ Windows tray app showing weekly Claude + Codex usage left. User-facing docs: `RE
 - Build command: see README. The exe only needs rebuilding when the .cs changes; script edits apply on restart.
 
 ## Script structure (top to bottom)
-Settings → `Write-Log` → Add-Type (P/Invoke + `AiFlyoutForm`) → fetch (`Get-ClaudeUsage`, `Get-CodexUsage` → normalized object: `WeekUsed`, `WeekResetAt` [DateTimeOffset], `WeekSeconds`, `FiveUsed`, `FiveResetAt`, `LimitReached`, `Plan`) → presentation (`Get-Pace`, `Get-Forecast`, `Get-Status`) → icon drawing (`New-ComboBitmap`, hinted text) → state/history/alerts (`Test-Alerts` returns an array of notes) → popup panel (`Render-Flyout` draws to a bitmap + hit regions) → `-LibOnly` return → `-Test`/`-MakeIco` modes → tray app (mutex, async fetch, menu, timers).
+Settings + `$AllServices` registry → `Write-Log`/`Write-LogOnce` → config (`Read-Config`, `Get-ServiceKeys`, `Update-ActiveServices` sets `$Services`) → Add-Type (P/Invoke + `AiFlyoutForm`) → fetch (`Get-ClaudeUsage`, `Get-CodexUsage`, `Get-CopilotUsage`, dispatched by `Get-Usage` via the registry's `Fetch` name → normalized object: `WeekUsed`, `WeekResetAt` [DateTimeOffset], `WeekSeconds`, `FiveUsed`, `FiveResetAt`, `LimitReached`, `Plan`) → presentation (`Get-Pace`, `Get-Forecast`, `Get-Status`) → icon drawing (`New-ComboBitmap`, hinted text) → state/history/alerts (`Test-Alerts` returns an array of notes) → popup panel (`Render-Flyout` draws to a bitmap + hit regions) → `-LibOnly` return → `-Test`/`-MakeIco` modes → tray app (mutex, async fetch, menu, timers).
 
 ## Key behaviors / gotchas
+- **Services are dynamic.** `$AllServices` lists every supported service. `$Services` is the active list: `-Only` (tests) > `config.json` `services` > services whose `Logins` file exists > Claude + Codex. It's re-evaluated (and `config.json` re-read) at the start of every `Start-Fetch`. Loop over `$Services`; never assume two. The icon shows the first two (one fills the whole icon); the tooltip drops to one line per service when there are 3+. State keeps entries for all of `$AllServices`.
+- **"Week" fields hold the main window, weekly or monthly.** Copilot's is a calendar month (`WeekSeconds` ~ 28-31 days). Use `Get-PeriodName`/`Get-PeriodAdj` (based on `WeekSeconds`) for user-facing words. Never write "week" literally.
+- Copilot token: `%LOCALAPPDATA%\github-copilot\apps.json`/`hosts.json` (`oauth_token` under a `github.com*` key), else `gh auth token` (started with `CreateNoWindow`, since the exe host has no console). The endpoint is `api.github.com/copilot_internal/user`, field `quota_snapshots.premium_interactions`.
 - **Fetching is async**: one background runspace per service (`Get-BgRunspace` dot-sources this script with `-LibOnly`), polled by a 250 ms Forms timer. Never call `Get-Usage` on the UI thread in tray mode. Jobs taking more than 45s are abandoned.
 - **Error handling**: "Can't reach service"/"Update timed out" are transient (keep data 15 min, retry in 1 min). HTTP 429 → `NextAllowed` back-off ≥10 min, keep data 30 min. Auth errors → gray immediately.
 - **Claude's usage endpoint rate-limits hard** (~35 calls/hour with bursts triggered 429). Avoid repeated live calls while testing.
@@ -29,11 +32,14 @@ Settings → `Write-Log` → Add-Type (P/Invoke + `AiFlyoutForm`) → fetch (`Ge
 - `-Test [-TestOut dir]`: prints tooltip/menu, saves `icon.png` + `panel-dark.png`/`panel-light.png`. Hits live endpoints once per run.
 - `-Test -Demo`: offline. Uses made-up usage (`New-DemoUsage`) and history (`Add-DemoHistory`), with scale 2x. **Prefer this for UI work.** Regenerate the README screenshots with `-Test -Demo -TestOut docs`.
 - `-Test -DemoHistory`: live numbers plus a made-up chart history.
+- `-Only copilot,codex`: pick the services for a test run (demo defaults to Claude + Codex so screenshots don't depend on the machine). `-Test -Only copilot` checks Copilot live without touching Claude's rate-limited endpoint.
+- Config is in `%LOCALAPPDATA%\AiUsageTray\config.json`. To test config logic without touching the real file, dot-source with `-LibOnly` and point `$ConfigPath` at a temp file.
 - To test the tray app without disturbing the real one: copy the script, change the mutex name `Local\AiUsageTray` and `$StateDir`, and replace the final `Application::Run()` with a timer that captures state and exits.
 - Runtime state: `%LOCALAPPDATA%\AiUsageTray\` (`state.json`, `history.csv`, `app.log`).
 
 ## Open ideas / TODO
-- `config.json` instead of editing script settings.
+- Copilot: read the VS Code / Copilot CLI login from Windows Credential Manager (`CredRead`).
+- Menu: reorder services (today only via `config.json`).
 - Claude Max: show per-model weekly limits (`seven_day_opus`, `seven_day_sonnet`) when present.
 - Panel placement for left/right taskbars.
 - Codex fallback: last `rate_limits` snapshot from `~/.codex/sessions/**/*.jsonl` when the endpoint fails.
