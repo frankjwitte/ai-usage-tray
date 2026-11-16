@@ -28,9 +28,27 @@ One or more of:
 
 The app shows the services it finds a login for. To choose yourself, see [Choosing services](#choosing-services).
 
-## Build and run
+## Run
 
-The `.exe` is a tiny host that runs `AiUsageTray.ps1`. With it, Windows lists the tray icon as "AI Usage Tray" and remembers its pin. Build it with the C# compiler that ships with Windows:
+```powershell
+conhost.exe --headless powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\AiUsageTray.ps1
+```
+
+`conhost --headless` starts PowerShell without a console window. Right-click the icon and select **Start with Windows** to launch it the same way at login. If Windows hides the icon under **^**, drag it onto the taskbar once.
+
+The icon registers with its own GUID, so Windows treats it as a separate tray icon, even though it runs in `powershell.exe`, and remembers its "show on taskbar" setting on its own.
+
+### Smart App Control
+
+Windows 11's **Smart App Control** blocks unsigned programs, with no "run anyway" and no allow list. The script only uses programs signed by Microsoft (`conhost.exe`, `powershell.exe`), so it works with Smart App Control on. That's why **Start with Windows** never uses the optional exe below. If Code Integrity blocks it, a check like this shows it:
+
+```powershell
+Get-WinEvent -LogName 'Microsoft-Windows-CodeIntegrity/Operational' -MaxEvents 200 | Where-Object Message -match 'AiUsageTray'
+```
+
+### Optional: AiUsageTray.exe
+
+`src/AiUsageTray.cs` is a tiny host that runs the script inside `AiUsageTray.exe`, so Task Manager shows "AI Usage Tray" instead of "Windows PowerShell". It's unsigned, so Smart App Control blocks it, and it can start doing so after a Windows update even if it ran before. Use it only on PCs with Smart App Control off. Build it with the C# compiler that ships with Windows and keep it next to `AiUsageTray.ps1`:
 
 ```powershell
 # app icon (optional, already in src/)
@@ -40,14 +58,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\AiUsageTray.ps1 -MakeIco .
 & "$env:SystemRoot\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /optimize `
   /out:AiUsageTray.exe /win32icon:src\AiUsageTray.ico `
   "/r:$([PSObject].Assembly.Location)" /r:System.Windows.Forms.dll src\AiUsageTray.cs
-```
-
-Then run `AiUsageTray.exe`. Keep it next to `AiUsageTray.ps1`, because the exe loads the script from its own folder. Right-click the icon and select **Start with Windows** to launch it at login. If Windows hides the icon under **^**, drag it onto the taskbar once.
-
-Without the exe, you can run the script directly. The icon then shows up as "Windows PowerShell":
-
-```powershell
-powershell -NoProfile -STA -ExecutionPolicy Bypass -File .\AiUsageTray.ps1
 ```
 
 ## How it works
@@ -76,7 +86,7 @@ Everything is stored under `%LOCALAPPDATA%\AiUsageTray\`:
 | `state.json` | settings (color mode) and which alerts already fired |
 | `history.csv` | one row per refresh, for the chart. Kept for 40 days |
 | `app.log` | errors and recoveries. Rotates at 256 KB |
-| `host.log` | only if the exe itself fails to start the script |
+| `host.log` | only if the optional exe fails to start the script |
 
 ## Choosing services
 

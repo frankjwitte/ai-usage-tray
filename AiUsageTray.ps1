@@ -5,8 +5,8 @@
   the logins those tools already keep on this machine and only reads them (never renews or changes them).
   Which services show is detected from those logins, or set in config.json (see Read-Config).
 
-  Normally started by AiUsageTray.exe (gives the tray icon its own name in Windows).
-  Direct run:  powershell -NoProfile -STA -ExecutionPolicy Bypass -File AiUsageTray.ps1
+  Run:         conhost.exe --headless powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File AiUsageTray.ps1
+               (what "Start with Windows" uses; works with Smart App Control on. AiUsageTray.exe is an optional host.)
   Test:        ... -File AiUsageTray.ps1 -Test [-TestOut <folder>] [-Only copilot,codex]   (prints data, saves icon previews, exits)
   App icon:    ... -File AiUsageTray.ps1 -MakeIco <path.ico>
 #>
@@ -131,13 +131,105 @@ Update-ActiveServices
 
 # ---------------- Setup ----------------
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-if (-not ('AiTrayNative' -as [type])) {
+if (-not ('AiTrayIcon' -as [type])) {
 Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @'
 using System; using System.Runtime.InteropServices; using System.Windows.Forms;
 public static class AiTrayNative {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr h);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+// Tray icon with its own GUID (WinForms NotifyIcon can't set one). Windows keeps tray settings
+// ("show on taskbar") per exe + GUID, so this icon gets its own entry even when the script runs
+// in powershell.exe, which Smart App Control allows (unlike our unsigned AiUsageTray.exe).
+// Falls back to a plain numbered icon if Windows refuses the GUID.
+public class AiTrayIcon : NativeWindow, IDisposable {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct NOTIFYICONDATA {
+        public int cbSize; public IntPtr hWnd; public int uID; public int uFlags; public int uCallbackMessage; public IntPtr hIcon;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string szTip;
+        public int dwState; public int dwStateMask;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string szInfo;
+        public int uVersion;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string szInfoTitle;
+        public int dwInfoFlags; public Guid guidItem; public IntPtr hBalloonIcon;
+    }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern bool Shell_NotifyIconW(int msg, ref NOTIFYICONDATA d);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int RegisterWindowMessageW(string s);
+    const int NIM_ADD = 0, NIM_MODIFY = 1, NIM_DELETE = 2, NIM_SETVERSION = 4;
+    const int NIF_MESSAGE = 1, NIF_ICON = 2, NIF_TIP = 4, NIF_INFO = 0x10, NIF_GUID = 0x20, NIF_SHOWTIP = 0x80;
+    const int CallbackMsg = 0x8001, NIN_SELECT = 0x400, NIN_KEYSELECT = 0x401, WM_CONTEXTMENU = 0x7B;
+    static readonly int TaskbarCreated = RegisterWindowMessageW("TaskbarCreated");
+    readonly Guid guid; bool useGuid, wanted, added; IntPtr icon = IntPtr.Zero; string tip = "";
+    public event EventHandler Click;       // left click or keyboard select
+    public event EventHandler RightClick;  // right click or context-menu key
+    public bool Added { get { return added; } }
+    public bool UsesGuid { get { return added && useGuid; } }
+    public AiTrayIcon(Guid g) { guid = g; CreateHandle(new CreateParams()); }
+
+    // Stable GUID per host exe path: Windows ties an unsigned app's icon GUID to the exe that first used it
+    public static Guid ForPath(string path) {
+        using (var md5 = System.Security.Cryptography.MD5.Create()) {
+            byte[] b = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes("AiUsageTray|" + path.ToLowerInvariant()));
+            b[7] = (byte)((b[7] & 0x0F) | 0x30); b[8] = (byte)((b[8] & 0x3F) | 0x80);
+            return new Guid(b);
+        }
+    }
+    NOTIFYICONDATA Data(int flags) {
+        var d = new NOTIFYICONDATA(); d.cbSize = Marshal.SizeOf(typeof(NOTIFYICONDATA)); d.hWnd = Handle; d.uID = 1;
+        d.szTip = ""; d.szInfo = ""; d.szInfoTitle = "";
+        if (useGuid) { flags |= NIF_GUID; d.guidItem = guid; }
+        d.uFlags = flags; return d;
+    }
+    bool TryAdd() {
+        if (useGuid) { var x = Data(0); Shell_NotifyIconW(NIM_DELETE, ref x); }   // leftover from a crashed run
+        var d = Data(NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP);
+        d.uCallbackMessage = CallbackMsg; d.hIcon = icon; d.szTip = tip;
+        added = Shell_NotifyIconW(NIM_ADD, ref d);
+        if (added) { var v = Data(0); v.uVersion = 4; Shell_NotifyIconW(NIM_SETVERSION, ref v); }
+        return added;
+    }
+    // Returns false if the taskbar isn't there yet; it's retried when the taskbar (re)starts or Show is called again.
+    public bool Show() {
+        wanted = true;
+        useGuid = guid != Guid.Empty;
+        if (useGuid && TryAdd()) return true;
+        useGuid = false;
+        if (TryAdd()) return true;
+        useGuid = guid != Guid.Empty;
+        return false;
+    }
+    public void Hide() {
+        wanted = false;
+        if (added) { var d = Data(0); Shell_NotifyIconW(NIM_DELETE, ref d); added = false; }
+    }
+    public void SetIcon(IntPtr h) {
+        icon = h;
+        if (added) { var d = Data(NIF_ICON); d.hIcon = h; Shell_NotifyIconW(NIM_MODIFY, ref d); }
+    }
+    public void SetText(string s) {
+        tip = s == null ? "" : (s.Length > 127 ? s.Substring(0, 127) : s);
+        if (added) { var d = Data(NIF_TIP | NIF_SHOWTIP); d.szTip = tip; Shell_NotifyIconW(NIM_MODIFY, ref d); }
+    }
+    public void ShowBalloon(string title, string text) {
+        if (!added) return;
+        var d = Data(NIF_INFO);
+        d.szInfoTitle = title.Length > 63 ? title.Substring(0, 63) : title;
+        d.szInfo = text.Length > 255 ? text.Substring(0, 255) : text;
+        d.dwInfoFlags = 1;   // NIIF_INFO
+        Shell_NotifyIconW(NIM_MODIFY, ref d);
+    }
+    protected override void WndProc(ref Message m) {
+        if (m.Msg == CallbackMsg) {
+            int ev = (int)((long)m.LParam & 0xFFFF);
+            if ((ev == NIN_SELECT || ev == NIN_KEYSELECT) && Click != null) Click(this, EventArgs.Empty);
+            else if (ev == WM_CONTEXTMENU && RightClick != null) RightClick(this, EventArgs.Empty);
+            return;
+        }
+        if (m.Msg == TaskbarCreated && wanted) { added = false; Show(); return; }   // Explorer restarted
+        base.WndProc(ref m);
+    }
+    public void Dispose() { Hide(); DestroyHandle(); }
 }
 // Borderless popup panel with Windows 11 rounded corners, hidden from taskbar and Alt+Tab
 public class AiFlyoutForm : Form {
@@ -1013,15 +1105,6 @@ $script:NextAllowed = @{}  # service key -> no fetching before this time (rate-l
 $script:PendingNotes = @()
 Write-Log "Started (pid $PID)"
 
-function Set-TipText([System.Windows.Forms.NotifyIcon]$ni, [string]$text) {
-    # NotifyIcon.Text is capped at 63 chars in .NET Framework; Windows allows 127. Set it directly.
-    if ($text.Length -gt 127) { $text = $text.Substring(0, 127) }
-    $t = [System.Windows.Forms.NotifyIcon]
-    $bf = [Reflection.BindingFlags]'NonPublic,Instance'
-    $t.GetField('text', $bf).SetValue($ni, $text)
-    if ($t.GetField('added', $bf).GetValue($ni)) { [void]$t.GetMethod('UpdateIcon', $bf).Invoke($ni, @($true)) }
-}
-
 function Get-AllStatus {
     # A display error in one service shows as a gray "?" half instead of freezing the whole icon
     foreach ($svc in $Services) {
@@ -1040,10 +1123,10 @@ function Update-Icon {
     $bmp = New-ComboBitmap @($st | Select-Object -First 2) $size
     $h = $bmp.GetHicon(); $bmp.Dispose()
     $old = $script:IconHandle
-    $script:Tray.Icon = [System.Drawing.Icon]::FromHandle($h)
+    $script:Tray.SetIcon($h)   # the shell keeps its own copy, so the old handle can go
     $script:IconHandle = $h
     if ($old -ne [IntPtr]::Zero) { [void][AiTrayNative]::DestroyIcon($old) }
-    Set-TipText $script:Tray (Get-TipText $st $script:LastUpdate)
+    $script:Tray.SetText((Get-TipText $st $script:LastUpdate))
 }
 
 # Fetching runs in background runspaces (one per service) so a slow or hung network never
@@ -1129,10 +1212,10 @@ function Show-PendingNotes {
     $notes = @($script:PendingNotes); $script:PendingNotes = @()
     try {
         if ($notes.Count -eq 1) {
-            $script:Tray.ShowBalloonTip(10000, $notes[0].Title, $notes[0].Text, [System.Windows.Forms.ToolTipIcon]::Info)
+            $script:Tray.ShowBalloon([string]$notes[0].Title, [string]$notes[0].Text)
         } elseif ($notes.Count -gt 1) {
             # Balloons replace each other, so combine them
-            $script:Tray.ShowBalloonTip(10000, 'AI usage alerts', (($notes | ForEach-Object { $_.Title }) -join "`n"), [System.Windows.Forms.ToolTipIcon]::Info)
+            $script:Tray.ShowBalloon('AI usage alerts', (($notes | ForEach-Object { $_.Title }) -join "`n"))
         }
     } catch { Write-Log "Notification failed: $_" }
 }
@@ -1233,21 +1316,34 @@ function Open-Config {
     Start-Process notepad.exe -ArgumentList "`"$ConfigPath`""
 }
 
+# The login shortcut always starts the script through Microsoft-signed programs, never AiUsageTray.exe:
+# Smart App Control blocks our unsigned exe (and may start doing so after any Windows update).
+# conhost --headless runs powershell.exe without a console window, not even a brief flash.
+$StartupTarget = Join-Path $env:SystemRoot 'System32\conhost.exe'
+$StartupArgs   = "--headless powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File `"$ScriptPath`""
+
 function Set-Startup([bool]$on) {
     if ($on) {
         $sh = New-Object -ComObject WScript.Shell
         $lnk = $sh.CreateShortcut($StartupLnk)
-        if ($env:AIUSAGETRAY_EXE -and (Test-Path $env:AIUSAGETRAY_EXE)) {
-            $lnk.TargetPath = $env:AIUSAGETRAY_EXE; $lnk.Arguments = ''
-        } else {
-            $lnk.TargetPath = Join-Path $env:SystemRoot 'System32\conhost.exe'
-            $lnk.Arguments = "--headless powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File `"$ScriptPath`""
-        }
+        $lnk.TargetPath = $StartupTarget
+        $lnk.Arguments = $StartupArgs
         $lnk.WorkingDirectory = Split-Path $ScriptPath
+        $lnk.IconLocation = "$(Join-Path (Split-Path $ScriptPath) 'src\AiUsageTray.ico'),0"
         $lnk.Description = 'AI Usage Tray'
         $lnk.Save()
     } elseif (Test-Path $StartupLnk) {
         Remove-Item $StartupLnk
+    }
+}
+
+# An older version pointed the login shortcut at AiUsageTray.exe. Rewrite it if it differs.
+function Update-StartupLink {
+    if (-not (Test-Path $StartupLnk)) { return }
+    $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($StartupLnk)
+    if ($lnk.TargetPath -ne $StartupTarget -or $lnk.Arguments -ne $StartupArgs) {
+        Set-Startup $true
+        Write-Log 'Updated the Start with Windows shortcut'
     }
 }
 
@@ -1304,7 +1400,7 @@ $menu.add_Opening({
     [void]$menu.Items.Add($ms)
     [void]$menu.Items.Add('-')
     $mq = $menu.Items.Add('Quit')
-    $mq.add_Click({ $script:Tray.Visible = $false; $script:Tray.Dispose(); [System.Windows.Forms.Application]::Exit() })
+    $mq.add_Click({ $script:Tray.Dispose(); [System.Windows.Forms.Application]::Exit() })
     $_.Cancel = $false
 })
 # ContextMenuStrip won't open when empty; give it a placeholder that Opening replaces
@@ -1329,17 +1425,27 @@ $script:Flyout.add_MouseClick({ param($s, $e)
     elseif ($h.Action -eq 'refresh') { Update-All $true }
 })
 
-$script:Tray = New-Object System.Windows.Forms.NotifyIcon
-$script:Tray.ContextMenuStrip = $menu
-$script:Tray.add_MouseClick({ param($s, $e)
-    if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+$hostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$script:Tray = New-Object AiTrayIcon ([AiTrayIcon]::ForPath($hostExe))
+$script:Tray.add_Click({
     if ($script:Flyout.Visible) { Hide-Flyout; return }
     # Clicking the icon while open first closes it (focus loss); don't immediately reopen
     if (((Get-Date) - $script:FlyHidden).TotalMilliseconds -lt 400) { return }
     Show-Flyout
 })
+$script:Tray.add_RightClick({
+    # Foreground first, or the menu won't close when you click elsewhere
+    [void][AiTrayNative]::SetForegroundWindow($script:Tray.Handle)
+    $pt = [System.Windows.Forms.Cursor]::Position
+    $wa = [System.Windows.Forms.Screen]::FromPoint($pt).WorkingArea
+    $dir = [System.Windows.Forms.ToolStripDropDownDirection]::BelowLeft
+    if ($pt.Y -gt $wa.Top + $wa.Height / 2) { $dir = [System.Windows.Forms.ToolStripDropDownDirection]::AboveLeft }
+    $menu.Show($pt, $dir)
+})
 Update-Icon
-$script:Tray.Visible = $true
+if ($script:Tray.Show()) { Write-Log "Tray icon added (own GUID: $($script:Tray.UsesGuid), host: $(Split-Path $hostExe -Leaf))" }
+else { Write-Log 'Taskbar not ready; the tray icon is added when it is' }
+try { Update-StartupLink } catch { Write-Log "Updating the startup shortcut failed: $_" }
 
 # Every 20s: redraw (keeps countdowns current) and decide whether to fetch.
 # Timers don't run during sleep, so a long gap since the last tick means the PC just woke up.
@@ -1350,6 +1456,7 @@ $timer.add_Tick({
     $now = Get-Date
     $woke = ($now - $script:LastTick).TotalSeconds -gt 90
     $script:LastTick = $now
+    if (-not $script:Tray.Added) { [void]$script:Tray.Show() }   # taskbar wasn't ready at login
     $since = ($now - $script:LastFetch).TotalSeconds
     $backoffOver = @($script:NextAllowed.Values | Where-Object { $now -ge $_ }).Count -gt 0
     $fetch = $woke -or $backoffOver -or $since -ge ($RefreshMinutes * 60) -or ($script:RetrySoon -and $since -ge 60)
